@@ -1308,6 +1308,7 @@ final class LiveChatSession: ChatSessionModel {
             AppLog.trace("send", "send \(lid): no runtime bound, resuming \(AppLog.tag(storedSessionId)) first")
             do { try await resumeNow() } catch {
                 AppLog.note("send", "send \(lid): resume before send failed: \(Self.logError(error))")
+                if stopEpoch != epoch { withdrawStoppedSend(localId: localId, text: draft, attachments: attachments); return }
                 if let retryItem, defersSendUntilReady || (error as? RPCError).map(Self.linkAwayForNow) == true,
                    requeueUnsent(retryItem, localId: localId, epoch: epoch) { return }
                 refuse((error as? RPCError)?.message ?? "Couldn’t reach this chat.")

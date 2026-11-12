@@ -261,6 +261,35 @@ struct StopSendRaceTests {
         #expect(!s.isRunning)
     }
 
+    /// A send Stop overtook while its pre-send resume was failing comes back as stopped, not as "Couldn’t reach this
+    /// chat" (the send-while-reconnecting retry must not swallow the withdraw).
+    @Test func aSendStoppedWhileItsResumeFailsComesBackStopped() async throws {
+        let h = try ChatHarness()
+        try h.setPage("24", "perf-page-latest-24.json")
+        let s = h.make()
+        s.keepQueue()
+        #expect(await h.open())
+        s.runtimeSessionId = nil
+        h.client.onCall { method, _ in
+            switch method {
+            case "session.resume":
+                try await Task.sleep(for: .milliseconds(150))
+                throw RPCError(code: 5000, message: "Resume failed.")
+            case "prompt.submit": return ["status": "streaming"]
+            case "session.interrupt": return ["status": "interrupted"]
+            default: return [:]
+            }
+        }
+        s.send("stopped words")
+        try? await Task.sleep(for: .milliseconds(20))
+        s.stop()
+        #expect(await waitUntil { !h.drafts.isEmpty })
+        #expect(h.drafts.first?.0 == "stopped words")
+        #expect(h.drafts.first?.1 == "Stopped before sending")
+        #expect(s.sendFailure == nil)
+        #expect(h.client.calls("prompt.submit").isEmpty)
+    }
+
     /// Messages typed before a task's chat was made go out in the order they were typed, also one sent just as the chat
     /// opened while the first still waited.
     @Test func sendsBeforeTheTaskChatOpensGoInOrder() async throws {
