@@ -2,6 +2,7 @@
 // gateway (docs/spec/3x-composer.md §1.6, §12.4, §16.3).
 
 import Foundation
+import Synchronization
 import Testing
 @testable import HermesHQNative
 
@@ -115,6 +116,113 @@ struct ComposerQueueTests {
         #expect(s.queuedMessages.map(\.text) == ["later"])
         #expect(!s.sendNextQueued(), "its reply is running now")
         #expect(h.client.calls("prompt.submit").count == 1)
+    }
+}
+
+@MainActor @Suite("Composer · sends during a gateway restart", .serialized)
+struct OfflineComposerSendTests {
+    private let ready: JSONValue = ["heartbeat": true, "change_events": true, "replay_epoch": "after-restart"]
+
+    @Test func offlineTextCanBeQueuedWithoutEnablingTalk() {
+        #expect(ComposerView.choosePrimary(memoSend: nil, enabled: false, preparing: false, hasText: true,
+                                           attachments: 0, memoChip: false, dictating: false, running: false,
+                                           talkAvailable: true, allowsDeferredSend: true) == .send)
+        #expect(ComposerView.choosePrimary(memoSend: nil, enabled: false, preparing: false, hasText: false,
+                                           attachments: 0, memoChip: false, dictating: false, running: false,
+                                           talkAvailable: true, allowsDeferredSend: true) == .disabled)
+    }
+
+    @Test func establishedChatDrainsInOrderAfterRestart() async throws {
+        let h = try ChatHarness()
+        h.setPage("24", rows: [])
+        let s = h.make()
+        s.keepQueue()
+        s.queueDrainFallback = .milliseconds(30)
+        #expect(await h.open())
+        #expect(await waitUntil { s.connection == .ready })
+        let resumed = try ChatFixtures.json("perf-resume.json")["result"]!
+        h.client.onCall { method, _ in
+            if method == "session.activate" || method == "session.resume" { return resumed }
+            if method == "prompt.submit" { return ["status": "streaming"] }
+            return [:]
+        }
+        h.client.setConnection(.reconnecting(attempt: 1))
+        #expect(await waitUntil { s.connection == .reconnecting(attempt: 1) })
+        s.send("First during restart")
+        s.send("Second during restart")
+        #expect(s.queuedMessages.map(\.text) == ["First during restart", "Second during restart"])
+        #expect(h.client.calls("prompt.submit").isEmpty)
+
+        h.client.setConnection(.ready)
+        h.client.setReady(ready)
+        h.client.setReady(ready)
+        #expect(await waitUntil { h.client.calls("prompt.submit").count == 1 })
+        #expect(h.client.calls("prompt.submit").map { $0.params["text"]?.string } == ["First during restart"])
+        #expect(s.queuedMessages.map(\.text) == ["Second during restart"])
+
+        await h.emit([h.event("message.start"), h.event("message.complete", ["text": "Done", "status": "complete"]),
+                      h.event("session.info", ["running": false])])
+        #expect(await waitUntil { h.client.calls("prompt.submit").count == 2 })
+        #expect(h.client.calls("prompt.submit").map { $0.params["text"]?.string } ==
+                ["First during restart", "Second during restart"])
+        #expect(s.queuedMessages.isEmpty)
+    }
+
+    @Test(arguments: [false, true]) func newChatRecoversAfterCreationFailedOffline(deferredOpen: Bool) async throws {
+        let client = FakeGatewayClient()
+        let attempts = Mutex(0)
+        let resumed = try ChatFixtures.json("perf-resume.json")["result"]!
+        client.onCall { method, _ in
+            if method == "session.resume" { return resumed }
+            if method == "prompt.submit" { return ["status": "streaming"] }
+            return [:]
+        }
+        let s = LiveChatSession(client: client, account: client.account, profile: "inbox", storedSessionId: nil,
+                                title: "New Chat", head: nil, cache: makeTempCache(), resolveSessionId: {
+            let attempt = attempts.withLock { $0 += 1; return $0 }
+            if !deferredOpen && attempt == 1 { throw RPCError.notSent(.offline) }
+            return "20261101_120000_aabbcc01"
+        }, startsNew: true, frameMode: .manual)
+        s.keepQueue()
+        s.opensOnFirstSend = deferredOpen
+        client.setConnection(.offline(reason: GatewayFailure.offline.code))
+        s.start()
+        #expect(await waitUntil { (deferredOpen || s.openFinished) && s.connection == .offline(reason: GatewayFailure.offline.code) })
+        s.send("First message in this chat")
+        #expect(s.queuedMessages.count == 1)
+        #expect(client.calls("prompt.submit").isEmpty)
+        client.setConnection(.ready)
+        client.setReady(ready)
+        client.setReady(ready)
+        #expect(await waitUntil { client.calls("prompt.submit").count == 1 })
+        #expect(attempts.withLock { $0 } == (deferredOpen ? 1 : 2))
+        #expect(s.openError == nil)
+        #expect(s.queuedMessages.isEmpty)
+    }
+
+    @Test func onlyRequestsKnownToBeUnsentRetry() async throws {
+        let h = try ChatHarness()
+        h.setPage("24", rows: [])
+        let s = h.make()
+        s.keepQueue()
+        s.queueDrainFallback = .milliseconds(30)
+        #expect(await h.open())
+        let attempts = Mutex(0)
+        h.client.onCall { method, _ in
+            guard method == "prompt.submit" else { return [:] }
+            let attempt = attempts.withLock { $0 += 1; return $0 }
+            if attempt == 1 { throw RPCError.notSent(.offline) }
+            throw RPCError.connectionLost(method)
+        }
+        s.send("Send this once")
+        #expect(await waitUntil { s.messages.contains { $0.error == LiveChatSession.unconfirmedMark } })
+        let requests = h.client.calls("prompt.submit")
+        #expect(requests.count == 2)
+        #expect(requests.first?.params["submission_id"] == requests.last?.params["submission_id"])
+        #expect(requests.first?.params["submission_id"]?.string != nil)
+        #expect(s.queuedMessages.isEmpty)
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(h.client.calls("prompt.submit").count == 2)
     }
 }
 

@@ -2053,7 +2053,13 @@ final class ChatViewController: UIViewController, UITableViewDataSource, UITable
         // [connect-fast] The first 2 s of a reconnect read as connecting (a send waits for the socket).
         var link = session.connection
         if case .reconnecting = link, !reconnectShown { link = .connecting }
-        // Sending waits for the connection; the field stays editable so a draft can be typed (spec 06 §5.6.4).
+        switch link {
+        case .offline, .reconnecting:
+            composer.allowsDeferredSend = (session as? LiveChatSession)?.canQueueWhileDisconnected == true
+        case .connecting, .ready, .signedOut:
+            composer.allowsDeferredSend = false
+        }
+        // Text and attachments can queue while the gateway is away. Voice and live controls still need the link.
         switch link {
         case .reconnecting:
             composer.isEnabled = false

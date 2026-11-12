@@ -217,7 +217,8 @@ final class AppModel: AppServices {
         guard let client, let account, let botStore else { return UnavailableChat(title: shownTitle, profile: bot.id, head: bot.head) }
         botStore.noteChatOpening(true)
         let profile = bot.id
-        let params = extra.merging(["profile": .string(profile), "follow_profile_config": true]) { _, base in base }
+        let params = extra.merging(["profile": .string(profile), "follow_profile_config": true,
+                                    "idempotency_key": .string(UUID().uuidString)]) { _, base in base }
         let chat = LiveChatSession(client: client, account: account, profile: profile, storedSessionId: nil, title: shownTitle,
                                    head: bot.head, cache: .shared,
                                    resolveSessionId: { [weak client] in

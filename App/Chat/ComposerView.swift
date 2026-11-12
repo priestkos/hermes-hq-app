@@ -45,6 +45,7 @@ final class ComposerView: UIView, UITextViewDelegate, HoldsOwnGlass, KeepsKeyboa
     var offersSteerQueue = true
     /// Sending allowed (the field stays editable either way, so a draft can be typed while reconnecting).
     var isEnabled = true { didSet { updatePrimary(animated: false); updateMic() } }   // VOICE: the mic dims too
+    var allowsDeferredSend = false { didSet { if oldValue != allowsDeferredSend { updatePrimary(animated: false) } } }
 
     // MENUS (spec 1x §7.1): the ☰ commands button at the bar's leading end (the attachments stream's + goes between it
     // and the text). Hidden until the chat screen shows it (1:1 chats on iPhone).
@@ -1143,7 +1144,8 @@ final class ComposerView: UIView, UITextViewDelegate, HoldsOwnGlass, KeepsKeyboa
         let memoSend: Bool? = { if case .send(let enabled) = memoPrimary { return enabled } else { return nil } }()
         next = Self.choosePrimary(memoSend: memoSend, enabled: isEnabled, preparing: attachmentsPreparing, hasText: hasText,
                                   attachments: attachmentCount, memoChip: memoChip != nil, dictating: dictating, running: isRunning,
-                                  talkAvailable: talkAvailable, editingQueued: editingQueued)
+                                  talkAvailable: talkAvailable, editingQueued: editingQueued,
+                                  allowsDeferredSend: allowsDeferredSend)
         // [composer] While a queued message is edited the circle is its Save (spec 3x-composer §15.5).
         defer {
             if memoSend == nil, next == .send || next == .disabled {
@@ -1152,7 +1154,7 @@ final class ComposerView: UIView, UITextViewDelegate, HoldsOwnGlass, KeepsKeyboa
         }
         defer { if case .send = memoPrimary { primaryButton.accessibilityLabel = "Send Voice Memo" } }   // VOICE
         // A hold on Send while a reply runs picks Steer or Queue (owner 2026-10-31); typed text only, as only it steers.
-        primaryButton.offersSendOptions = next == .send && isRunning && offersSteerQueue && hasText && attachmentCount == 0
+        primaryButton.offersSendOptions = isEnabled && next == .send && isRunning && offersSteerQueue && hasText && attachmentCount == 0
             && memoPrimary == .normal && memoChip == nil && !editingQueued
         guard next != primary || primaryButton.kind != next else { return }
         primary = next
@@ -1163,7 +1165,8 @@ final class ComposerView: UIView, UITextViewDelegate, HoldsOwnGlass, KeepsKeyboa
 
     /// What the circle is, first match wins (docs/spec/3x-talk.md §5.1).
     nonisolated static func choosePrimary(memoSend: Bool?, enabled: Bool, preparing: Bool, hasText: Bool, attachments: Int, memoChip: Bool,
-                                          dictating: Bool, running: Bool, talkAvailable: Bool, editingQueued: Bool = false) -> Primary {
+                                          dictating: Bool, running: Bool, talkAvailable: Bool, editingQueued: Bool = false,
+                                          allowsDeferredSend: Bool = false) -> Primary {
         if let memoSend { return memoSend ? .send : .disabled }
         // A dictation's Stop comes before Send: its words aren't in the field yet, so a Send now would go without them
         // (owner 2026-11-01: with a picture in the tray the circle was Send, and only the picture went). It works even
@@ -1172,7 +1175,9 @@ final class ComposerView: UIView, UITextViewDelegate, HoldsOwnGlass, KeepsKeyboa
         // [composer] Editing a queued message: the circle is Save (off while blank), Stop waits behind it, and the
         // queue is the phone's own, so it saves offline too (docs/spec/3x-composer.md §15.5).
         if editingQueued { return hasText ? .send : .disabled }
-        if !enabled { return .disabled }
+        if !enabled {
+            return allowsDeferredSend && !preparing && !memoChip && (hasText || attachments > 0) ? .send : .disabled
+        }
         if preparing && (hasText || attachments > 0) { return .disabled }      // [attachments]
         if hasText || attachments > 0 || memoChip { return .send }
         if running { return .stop }

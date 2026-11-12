@@ -198,7 +198,7 @@ final class LiveChatSession: ChatSessionModel {
     /// gives every chat the account's one store. Nil: nothing is kept.
     var lostSends: LostSends?
 
-    /// Texts sent while a reply runs, oldest first (04 §6.2 M1). Shown as a queue card above the composer, not as rows.
+    /// Messages waiting for a reply to finish or for the gateway to reconnect, oldest first.
     /// VOICE: settable from LiveChatSession+Memo.swift (memos queue too). Verify round 3: kept beyond the screen in the
     /// account's `QueueStash` (written through while this chat owns it; LiveChatSession+Away.swift).
     /// [m9/composer] Rows being steered into the running reply (the lock, spec §15.4), and a chat whose gateway said it
@@ -347,6 +347,22 @@ final class LiveChatSession: ChatSessionModel {
     /// The app's chats keep their queue beyond the screen (the stash, the off-screen drain); set by the app model with
     /// `keepQueue()` before the first frame. Off for chats made by tests and previews.
     private(set) var keepsQueue = false
+    var canQueueWhileDisconnected: Bool { keepsQueue && !chatGone }
+
+    private var defersSendUntilReady: Bool {
+        guard canQueueWhileDisconnected else { return false }
+        switch connection {
+        case .connecting, .reconnecting, .offline: return true
+        case .ready, .signedOut: return false
+        }
+    }
+
+    private var canDrainQueue: Bool {
+        guard case .ready = connection else { return false }
+        return isLive && !parking && !chatGone
+    }
+
+    private var retryQueuedOpenAfterFlight = false
 
     /// Verify round 3: this chat's queue outlives its screen; one left behind in it shows (and drains) again.
     func keepQueue() {
@@ -649,7 +665,7 @@ final class LiveChatSession: ChatSessionModel {
     /// [tasks] A task's chat not made yet (`opensOnFirstSend`) is made by its first message, which waits for it (up to
     /// 4 s). (Starting to write had made it, so a letter typed and deleted left an empty chat on the task.)
     func openIfWaiting() {
-        guard opensOnFirstSend, !started, observing else { return }
+        guard opensOnFirstSend, !started, isLive else { return }
         opensOnFirstSend = false
         madeOnWriting = true
         beginOpen(failedOpen: false)
@@ -731,7 +747,18 @@ final class LiveChatSession: ChatSessionModel {
         guard state != connection else { return }
         AppLog.trace("chat", "connection \(logIds): \(connection) → \(state)")
         connection = state
-        if case .ready = state { everReady = true }
+        if case .ready = state {
+            everReady = true
+            if !openSettled, !queuedMessages.isEmpty, !isQueueParked, !chatGone, isLive {
+                if openTask != nil {
+                    retryQueuedOpenAfterFlight = true
+                } else if opensOnFirstSend {
+                    openIfWaiting()
+                } else if openFinished {
+                    beginOpen(failedOpen: true)
+                }
+            }
+        }
         changes.markState()
         scheduleFlush()
     }
@@ -742,6 +769,12 @@ final class LiveChatSession: ChatSessionModel {
         defer {
             openFinished = true
             openTask = nil
+            if retryQueuedOpenAfterFlight {
+                retryQueuedOpenAfterFlight = false
+                if !openSettled, !queuedMessages.isEmpty, !isQueueParked, canDrainQueue, !Task.isCancelled {
+                    beginOpen(failedOpen: true)
+                }
+            }
         }
         let openStart = ContinuousClock.now
         guard let stored = await ensureStoredId() else {
@@ -1109,6 +1142,10 @@ final class LiveChatSession: ChatSessionModel {
             send(wrapped.text, display: wrapped.display, attachments: attachments)
             return
         }
+        if defersSendUntilReady && preOpenWaiting == 0 {
+            sendAfterOpen(text, display: display, attachments: attachments)
+            return
+        }
         if opensOnFirstSend || (madeOnWriting && !openSettled && !openFinished) || preOpenWaiting > 0 {
             openIfWaiting()
             let deadline = ContinuousClock.now + .seconds(4)
@@ -1147,17 +1184,18 @@ final class LiveChatSession: ChatSessionModel {
         // Desktop parity (owner 2026-10-28): plain text typed while a reply runs goes into that reply, and leaves a
         // paused queue paused (only a queued message un-pauses it, as on the desktop). A queued send (⌘Return, Send ›
         // Queue, or Settings › Chat › Send While Replying set to Queue) waits instead.
-        if !toQueue, steersTyped(text, display: display, attachments: attachments) {
+        let defersForLink = defersSendUntilReady
+        if !toQueue, !defersForLink, steersTyped(text, display: display, attachments: attachments) {
             steerTyped(text)
             return
         }
         // Verify round 3: a fresh message is fresh intent to keep the conversation moving, so a park left by an earlier
         // Stop (or refusal) never holds it, or the messages queued ahead of it, back (the web's `enqueueQueuedPrompt`
         // unparks). Sent while idle it goes first; the parked ones follow its reply.
-        let waitInLine = turn.busy || (!queuedMessages.isEmpty && !isQueueParked)
+        let waitInLine = defersForLink || turn.busy || (!queuedMessages.isEmpty && !isQueueParked)
         unparkQueue()
         if waitInLine {
-            // A reply is running (or queued messages are still going out): wait in the FIFO, in order (04 §6.2 M1).
+            // Wait in the FIFO for the connection, the current reply or the messages already ahead of this one.
             let qid = nextQueuedId()
             AppLog.trace("send", "queued \(AppLog.tag(qid)) in \(logIds): busy=\(turn.busy), \(queuedMessages.count) ahead, attachments=\(attachments.count)")
             queuedMessages.append(QueuedMessage(id: qid, text: text, attachments: attachments, display: display))
@@ -1166,17 +1204,20 @@ final class LiveChatSession: ChatSessionModel {
             if !turn.busy { drainQueueHead() }
             return
         }
-        beginSend(text, display: display, queued: false, attachments: attachments)
+        let retryItem = canQueueWhileDisconnected && attachments.isEmpty
+            ? QueuedMessage(id: nextQueuedId(), text: text, display: display) : nil
+        beginSend(text, display: display, queued: false, attachments: attachments, retryItem: retryItem)
     }
 
     /// The optimistic bubble, busy at once, then `prompt.submit` (with `queued:true` for queue drains).
     /// VOICE: `memo` stages the memo first (LiveChatSession+Memo.swift); its watchdog arms when `prompt.submit` goes out.
     func beginSend(_ text: String, display: String? = nil, queued: Bool, attachments: [DraftAttachment] = [],
-                   memo: MemoSendContext? = nil, interrupted: Bool = false, voiceContext: String? = nil) {   // [talk] interrupted
+                   memo: MemoSendContext? = nil, interrupted: Bool = false, voiceContext: String? = nil,
+                   retryItem: QueuedMessage? = nil) {   // [talk] interrupted
         openIfWaiting()   // [tasks] a memo as a task's first message makes its chat as it stages
         sealLeftoverLiveMessage()
         localCounter += 1
-        let localId = "local-user-\(localCounter)-\(UInt32.random(in: 0...UInt32.max))"
+        let localId = "local-user-" + (retryItem?.id ?? "\(localCounter)-\(UInt32.random(in: 0...UInt32.max))")
         AppLog.trace("send", "send \(AppLog.tag(localId)) in \(logIds): queued=\(queued), attachments=\(attachments.count), memo=\(memo != nil), voice=\(voiceContext != nil), interrupted=\(interrupted), waits for stop=\(turn.stopTerminalPending), \(memo.map(Self.memoLogWords) ?? "\(text.count) chars")")
         if let voiceContext { voiceLiveSends[localId] = voiceContext }   // [gpt-live]
         let typed = display ?? text                                                                     // MENUS
@@ -1220,14 +1261,15 @@ final class LiveChatSession: ChatSessionModel {
         }
         Task { [weak self] in
             await self?.submit(text, draft: display ?? text, localId: localId, queued: queued, holdForStop: holdForStop, epoch: epoch,
-                               attachments: attachments, interrupted: interrupted)   // [talk] interrupted
+                               attachments: attachments, interrupted: interrupted, retryItem: retryItem)   // [talk] interrupted
         }
     }
 
     /// `draft`: what a refused or withdrawn send hands back to the composer (MENUS: a skill's invocation, not its body;
     /// nil = `text`). VOICE: internal.
     func submit(_ text: String, draft: String? = nil, localId: String, queued: Bool, holdForStop: Bool, epoch: Int,
-                attachments: [DraftAttachment] = [], interrupted: Bool = false) async {   // [talk] interrupted
+                attachments: [DraftAttachment] = [], interrupted: Bool = false,
+                retryItem: QueuedMessage? = nil) async {   // [talk] interrupted
         let draft = draft ?? text
         // A send turned down. One that Stop overtook never went out either: its words come back as stopped, with no
         // "Couldn’t Send" card, no park and no settle (by then the chat may be running the next message's turn).
@@ -1266,7 +1308,8 @@ final class LiveChatSession: ChatSessionModel {
             AppLog.trace("send", "send \(lid): no runtime bound, resuming \(AppLog.tag(storedSessionId)) first")
             do { try await resumeNow() } catch {
                 AppLog.note("send", "send \(lid): resume before send failed: \(Self.logError(error))")
-                if stopEpoch != epoch { withdrawStoppedSend(localId: localId, text: draft, attachments: attachments); return }
+                if let retryItem, defersSendUntilReady || (error as? RPCError).map(Self.linkAwayForNow) == true,
+                   requeueUnsent(retryItem, localId: localId, epoch: epoch) { return }
                 refuse((error as? RPCError)?.message ?? "Couldn’t reach this chat.")
                 return
             }
@@ -1364,6 +1407,8 @@ final class LiveChatSession: ChatSessionModel {
                     }
                     continue
                 }
+                if let retryItem, ownerDeadline == nil, Self.linkAwayForNow(error),
+                   requeueUnsent(retryItem, localId: localId, epoch: epoch) { return }
                 // The request may have reached the gateway (no answer in time, or the socket closed before it
                 // answered): never resent and never handed back for a resend — "Delivery unconfirmed" (04 §2.5). On
                 // Hermes the turn runs anyway. One that never went out (`isNotConnected`) is safe to refuse below.
@@ -1474,6 +1519,8 @@ final class LiveChatSession: ChatSessionModel {
                     runtimeSessionId = nil
                     do { try await resumeNow() } catch {
                         AppLog.note("send", "send \(lid): resume inside \(firstError?.code ?? 0) recovery failed: \(Self.logError(error))")
+                        if let retryItem, defersSendUntilReady || (error as? RPCError).map(Self.linkAwayForNow) == true,
+                           requeueUnsent(retryItem, localId: localId, epoch: epoch) { return }
                         // Inside 4001 recovery, report the original error (04 §2.4.1).
                         refuse(firstError?.message ?? "Couldn’t reach this chat.")
                         return
@@ -1555,6 +1602,20 @@ final class LiveChatSession: ChatSessionModel {
         onDraftReturned?(text, "Stopped before sending")
     }
 
+    /// Returns a text send to the head only when the client knows no prompt was admitted.
+    private func requeueUnsent(_ item: QueuedMessage, localId: String, epoch: Int) -> Bool {
+        guard stopEpoch == epoch, turn.userAnchorId == localId, !turn.turnLive, !turn.sawAssistantPayload else { return false }
+        AppLog.trace("send", "send \(AppLog.tag(localId)) never left; queued for reconnect")
+        removeMessage(localId)
+        turn.userAnchorId = nil
+        settleFlags()
+        queuedMessages.insert(item, at: 0)
+        changes.markState()
+        scheduleFlush()
+        scheduleQueueDrain(after: queueDrainFallback)
+        return true
+    }
+
     // MARK: Queue (04 §6.2 M1)
 
     /// Sends a queued message now: at once when idle; while a reply runs, it moves to the head and the reply is stopped
@@ -1604,7 +1665,7 @@ final class LiveChatSession: ChatSessionModel {
     /// Drains the head once the turn has ended: at once after `session.info running:false`, else after a short wait for
     /// it (`queued:true` keeps a still-running turn from being interrupted either way).
     func scheduleQueueDrain(after delay: Duration) {
-        guard !queuedMessages.isEmpty, !isQueueParked, isLive else { return }
+        guard !queuedMessages.isEmpty, !isQueueParked, canDrainQueue else { return }
         queueDrainTask?.cancel()
         queueDrainTask = Task { [weak self] in
             if delay > .zero { try? await Task.sleep(for: delay) }
@@ -1615,14 +1676,15 @@ final class LiveChatSession: ChatSessionModel {
     }
 
     func drainQueueHead() {
-        guard !queuedMessages.isEmpty, !isQueueParked, !turn.busy, isLive, queuedMessages.first?.id != queueEditingId else { return }
+        guard !queuedMessages.isEmpty, !isQueueParked, !turn.busy, canDrainQueue, queuedMessages.first?.id != queueEditingId else { return }
         queueDrainTask?.cancel(); queueDrainTask = nil
         let next = queuedMessages.removeFirst()
         AppLog.trace("send", "queue drain \(logIds): \(AppLog.tag(next.id)) goes out (\(next.hidden ? "hidden goal" : next.memo != nil ? "memo" : "message"), \(queuedMessages.count) left, \(observing ? "on screen" : "off screen"))")
         changes.markState()
         if next.hidden { submitHidden(next.text, queued: true); return }    // [activity] goal continuation
         if let memo = next.memo { beginMemoSend(memo, typed: next.text, queued: true); return }   // VOICE
-        beginSend(next.text, display: next.display, queued: true, attachments: next.attachments)
+        beginSend(next.text, display: next.display, queued: true, attachments: next.attachments,
+                  retryItem: canQueueWhileDisconnected && next.attachments.isEmpty ? next : nil)
     }
 
     /// [activity] Queues a hidden goal continuation behind the running reply (docs/spec/1x-activity.md §6.4).
